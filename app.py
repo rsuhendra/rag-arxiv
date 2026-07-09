@@ -157,61 +157,80 @@ def get_latest_papers(topic: str, limit: int = 20) -> pd.DataFrame:
             PUBLISHED,
             ABS_URL
         FROM ARXIV_PAPERS
-        WHERE TOPIC = %(topic)s
+        WHERE TOPIC = ?
         ORDER BY PUBLISHED DESC
         LIMIT {int(limit)}
         """,
-        params={"topic": topic},
+        params=[topic],
     )
-
 
 def retrieve_papers(
     user_query: str,
     topic: str,
     k: int,
 ) -> pd.DataFrame:
-    """
-    Embed the user query in Python and compare it with stored Snowflake
-    VECTOR values using cosine similarity.
-    """
     conn = get_connection()
 
     query_embedding = embed_query(user_query)
     query_embedding_json = json.dumps(query_embedding)
 
-    topic_clause = ""
-    params = {
-        "query_embedding": query_embedding_json,
-    }
+    if topic == "All":
+        sql = f"""
+        SELECT
+            p.ARXIV_ID,
+            p.TITLE,
+            p.ABSTRACT,
+            p.AUTHORS,
+            p.CATEGORIES,
+            p.PRIMARY_CATEGORY,
+            p.TOPIC,
+            p.PUBLISHED,
+            p.ABS_URL,
+            VECTOR_COSINE_SIMILARITY(
+                p.EMBEDDING,
+                PARSE_JSON(?)::VECTOR(FLOAT, {EMBEDDING_DIM})
+            ) AS SIMILARITY
+        FROM ARXIV_PAPERS p
+        WHERE p.EMBEDDING IS NOT NULL
+        ORDER BY SIMILARITY DESC
+        LIMIT {int(k)}
+        """
 
-    if topic != "All":
-        topic_clause = "AND p.TOPIC = %(topic)s"
-        params["topic"] = topic
+        params = [query_embedding_json]
 
-    sql = f"""
-    SELECT
-        p.ARXIV_ID,
-        p.TITLE,
-        p.ABSTRACT,
-        p.AUTHORS,
-        p.CATEGORIES,
-        p.PRIMARY_CATEGORY,
-        p.TOPIC,
-        p.PUBLISHED,
-        p.ABS_URL,
-        VECTOR_COSINE_SIMILARITY(
-            p.EMBEDDING,
-            PARSE_JSON(%(query_embedding)s)::VECTOR(FLOAT, {EMBEDDING_DIM})
-        ) AS SIMILARITY
-    FROM ARXIV_PAPERS p
-    WHERE p.EMBEDDING IS NOT NULL
-    {topic_clause}
-    ORDER BY SIMILARITY DESC
-    LIMIT {int(k)}
-    """
+    else:
+        sql = f"""
+        SELECT
+            p.ARXIV_ID,
+            p.TITLE,
+            p.ABSTRACT,
+            p.AUTHORS,
+            p.CATEGORIES,
+            p.PRIMARY_CATEGORY,
+            p.TOPIC,
+            p.PUBLISHED,
+            p.ABS_URL,
+            VECTOR_COSINE_SIMILARITY(
+                p.EMBEDDING,
+                PARSE_JSON(?)::VECTOR(FLOAT, {EMBEDDING_DIM})
+            ) AS SIMILARITY
+        FROM ARXIV_PAPERS p
+        WHERE p.EMBEDDING IS NOT NULL
+          AND p.TOPIC = ?
+        ORDER BY SIMILARITY DESC
+        LIMIT {int(k)}
+        """
 
-    return conn.query(sql, params=params)
+        params = [
+            query_embedding_json,
+            topic,
+        ]
 
+    return conn.query(
+        sql,
+        params=params,
+        ttl=0,
+    )
 
 def log_query(
     user_query: str,
