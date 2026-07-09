@@ -1,146 +1,170 @@
 from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
+from sentence_transformers import SentenceTransformer
 
-st.set_page_config(page_title="arXiv RAG Explorer", page_icon="📚", layout="wide")
-st.title("📚 arXiv RAG Explorer")
-st.caption("A tiny Snowflake + Cortex + Streamlit RAG prototype over recent arXiv abstracts.")
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+st.set_page_config(page_title="Live AI Research Assistant", page_icon="📚", layout="wide")
+st.title("📚 Live AI Research Assistant")
+st.caption("Hourly arXiv ingestion + topic trends + Snowflake vector search.")
 
 @st.cache_resource
 def get_connection():
     return st.connection("snowflake")
 
+@st.cache_resource
+def get_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(MODEL_NAME)
+
+def embed_query(query: str) -> list[float]:
+    emb = get_embedding_model().encode(query, normalize_embeddings=True, show_progress_bar=False)
+    return emb.astype(float).tolist()
+
 @st.cache_data(ttl=300)
-def get_stats():
-    conn = get_connection()
-    return conn.query("""
-        SELECT COUNT(*) AS NUM_PAPERS, MIN(PUBLISHED) AS EARLIEST_PAPER,
-               MAX(PUBLISHED) AS LATEST_PAPER,
-               (SELECT COUNT(*) FROM ARXIV_EMBEDDINGS) AS NUM_EMBEDDINGS
+def get_stats() -> pd.DataFrame:
+    return get_connection().query("""
+        SELECT COUNT(*) AS NUM_PAPERS,
+               COUNT_IF(EMBEDDING IS NOT NULL) AS NUM_EMBEDDED,
+               MIN(PUBLISHED) AS EARLIEST_PAPER,
+               MAX(PUBLISHED) AS LATEST_PAPER
         FROM ARXIV_PAPERS
     """)
 
 @st.cache_data(ttl=300)
-def get_category_counts():
-    conn = get_connection()
-    return conn.query("""
-        SELECT COALESCE(PRIMARY_CATEGORY, 'unknown') AS CATEGORY, COUNT(*) AS N
+def get_topics() -> list[str]:
+    df = get_connection().query("SELECT DISTINCT TOPIC FROM ARXIV_PAPERS WHERE TOPIC IS NOT NULL ORDER BY TOPIC")
+    return ["All"] + df["TOPIC"].dropna().tolist()
+
+@st.cache_data(ttl=300)
+def get_topic_counts() -> pd.DataFrame:
+    return get_connection().query("SELECT TOPIC, COUNT(*) AS N FROM ARXIV_PAPERS GROUP BY TOPIC ORDER BY N DESC")
+
+@st.cache_data(ttl=300)
+def get_topic_trends() -> pd.DataFrame:
+    return get_connection().query("""
+        SELECT DATE_TRUNC('DAY', PUBLISHED) AS PUBLISHED_DAY, TOPIC, COUNT(*) AS N
         FROM ARXIV_PAPERS
-        GROUP BY CATEGORY
-        ORDER BY N DESC
-        LIMIT 15
+        WHERE PUBLISHED >= DATEADD('DAY', -14, CURRENT_TIMESTAMP())
+        GROUP BY PUBLISHED_DAY, TOPIC
+        ORDER BY PUBLISHED_DAY
     """)
 
-def retrieve_papers(user_query: str, k: int) -> pd.DataFrame:
-    conn = get_connection()
+@st.cache_data(ttl=300)
+def get_latest_papers(topic: str, limit: int = 20) -> pd.DataFrame:
+    where = "" if topic == "All" else "WHERE TOPIC = %(topic)s"
+    return get_connection().query(f"""
+        SELECT ARXIV_ID, TITLE, TOPIC, PRIMARY_CATEGORY, PUBLISHED, ABS_URL, ABSTRACT
+        FROM ARXIV_PAPERS
+        {where}
+        ORDER BY PUBLISHED DESC
+        LIMIT {int(limit)}
+    """, params={"topic": topic})
+
+def retrieve_papers(user_query: str, topic: str, k: int) -> pd.DataFrame:
+    query_embedding = embed_query(user_query)
+    topic_filter = "" if topic == "All" else "AND p.TOPIC = %(topic)s"
     sql = f"""
-    WITH query_embedding AS (
-        SELECT SNOWFLAKE.CORTEX.EMBED_TEXT_768('snowflake-arctic-embed-m', %(user_query)s) AS q_embedding
-    )
     SELECT p.ARXIV_ID, p.TITLE, p.ABSTRACT, p.AUTHORS, p.CATEGORIES, p.PRIMARY_CATEGORY,
-           p.PUBLISHED, p.ABS_URL,
-           VECTOR_COSINE_SIMILARITY(e.EMBEDDING, q.q_embedding) AS SIMILARITY
-    FROM ARXIV_EMBEDDINGS e
-    JOIN ARXIV_PAPERS p ON e.ARXIV_ID = p.ARXIV_ID
-    CROSS JOIN query_embedding q
+           p.TOPIC, p.PUBLISHED, p.ABS_URL,
+           VECTOR_COSINE_SIMILARITY(p.EMBEDDING, %(query_embedding)s::VECTOR(FLOAT, 384)) AS SIMILARITY
+    FROM ARXIV_PAPERS p
+    WHERE p.EMBEDDING IS NOT NULL
+    {topic_filter}
     ORDER BY SIMILARITY DESC
     LIMIT {int(k)}
     """
-    return conn.query(sql, params={"user_query": user_query})
+    return get_connection().query(sql, params={"query_embedding": query_embedding, "topic": topic})
 
-def build_context(retrieved: pd.DataFrame) -> str:
-    parts = []
-    for idx, row in retrieved.reset_index(drop=True).iterrows():
-        parts.append(f"""Source {idx + 1}
-Title: {row["TITLE"]}
-arXiv ID: {row["ARXIV_ID"]}
-Categories: {row["CATEGORIES"]}
-Published: {row["PUBLISHED"]}
-Abstract: {row["ABSTRACT"]}""")
-    return "\n\n".join(parts)
-
-def generate_answer(user_query: str, retrieved: pd.DataFrame, model: str) -> str:
-    conn = get_connection()
-    prompt = f"""You are a careful research assistant.
-
-Answer the user question using only the provided arXiv abstract context.
-Do not claim you read the full papers.
-If the abstracts do not contain enough information, say so.
-Cite sources using bracketed source numbers like [Source 1].
-
-User question:
-{user_query}
-
-Retrieved abstract context:
-{build_context(retrieved)}"""
-    result = conn.query(
-        "SELECT SNOWFLAKE.CORTEX.COMPLETE(%(model)s, %(prompt)s) AS ANSWER",
-        params={"model": model, "prompt": prompt},
-    )
-    return result.iloc[0]["ANSWER"]
-
-def log_query(user_query: str, answer: str, retrieved: pd.DataFrame) -> None:
-    conn = get_connection()
+def log_query(user_query: str, topic: str, retrieved: pd.DataFrame) -> None:
     ids = ",".join(retrieved["ARXIV_ID"].astype(str).tolist())
-    conn.query("""
-        INSERT INTO ARXIV_QUERIES (USER_QUERY, ANSWER, RETRIEVED_ARXIV_IDS, NUM_RETRIEVED)
-        SELECT %(user_query)s, %(answer)s, %(ids)s, %(num_retrieved)s
-    """, params={"user_query": user_query, "answer": answer, "ids": ids, "num_retrieved": int(len(retrieved))})
+    get_connection().query("""
+        INSERT INTO ARXIV_QUERIES (USER_QUERY, TOPIC_FILTER, RETRIEVED_ARXIV_IDS, NUM_RETRIEVED)
+        SELECT %(user_query)s, %(topic)s, %(ids)s, %(num_retrieved)s
+    """, params={"user_query": user_query, "topic": topic, "ids": ids, "num_retrieved": int(len(retrieved))})
 
-with st.sidebar:
-    st.header("Settings")
-    k = st.slider("Retrieved abstracts", 3, 10, 5)
-    model = st.selectbox("Cortex LLM", ["mistral-large2", "llama3.1-70b", "mixtral-8x7b"], index=0)
+def make_summary(user_query: str, retrieved: pd.DataFrame) -> str:
+    if retrieved.empty:
+        return "No relevant papers were retrieved."
+    lines = [f"Top relevant papers for: **{user_query}**", ""]
+    for i, row in retrieved.head(3).reset_index(drop=True).iterrows():
+        preview = row["ABSTRACT"][:350] + ("..." if len(row["ABSTRACT"]) > 350 else "")
+        lines.append(f"**[{i+1}] {row['TITLE']}** ({row['TOPIC']}, similarity {row['SIMILARITY']:.3f})
+
+{preview}
+")
+    lines.append("This is an extractive retrieval summary. Add an external LLM later for fully generative RAG answers.")
+    return "
+".join(lines)
 
 try:
-    stats = get_stats()
-    s = stats.iloc[0]
+    s = get_stats().iloc[0]
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Papers", int(s["NUM_PAPERS"]))
-    c2.metric("Embeddings", int(s["NUM_EMBEDDINGS"]))
+    c2.metric("Embedded", int(s["NUM_EMBEDDED"]))
     c3.metric("Earliest", str(s["EARLIEST_PAPER"])[:10])
     c4.metric("Latest", str(s["LATEST_PAPER"])[:10])
-    with st.expander("Category distribution"):
-        cat_df = get_category_counts()
-        st.bar_chart(cat_df.set_index("CATEGORY"))
 except Exception as exc:
-    st.error(f"Could not query Snowflake. Check secrets and Snowflake objects. Error: {exc}")
+    st.error(f"Could not query Snowflake. Check Streamlit secrets and table setup. Error: {exc}")
     st.stop()
 
-st.divider()
-examples = [
-    "What are recent ideas for efficient transformer training?",
-    "What methods are being used for diffusion models?",
-    "Are there recent papers related to causal discovery?",
-    "Summarize papers about reinforcement learning.",
-]
-user_query = st.text_input("Ask a question about the ingested arXiv abstracts", placeholder=examples[0])
-cols = st.columns(len(examples))
-for col, ex in zip(cols, examples):
-    if col.button(ex, use_container_width=True):
-        user_query = ex
+topics = get_topics()
+with st.sidebar:
+    st.header("Controls")
+    selected_topic = st.selectbox("Topic", topics, index=0)
+    k = st.slider("Retrieved papers", 3, 10, 5)
 
-if st.button("Run RAG search", type="primary") and user_query:
-    with st.spinner("Retrieving relevant abstracts..."):
-        retrieved = retrieve_papers(user_query, k)
-    if retrieved.empty:
-        st.warning("No results found. Did you run the embedding update?")
-        st.stop()
-    with st.spinner("Generating grounded answer..."):
-        answer = generate_answer(user_query, retrieved, model)
-    st.subheader("Answer")
-    st.write(answer)
-    try:
-        log_query(user_query, answer, retrieved)
-    except Exception as exc:
-        st.warning(f"Answer generated, but query logging failed: {exc}")
-    st.subheader("Retrieved sources")
-    for idx, row in retrieved.reset_index(drop=True).iterrows():
-        with st.expander(f"Source {idx + 1}: {row['TITLE']} · similarity {row['SIMILARITY']:.3f}"):
-            st.write(f"**arXiv ID:** {row['ARXIV_ID']}")
-            st.write(f"**Primary category:** {row['PRIMARY_CATEGORY']}")
-            st.write(f"**Categories:** {row['CATEGORIES']}")
-            st.write(f"**Published:** {row['PUBLISHED']}")
-            st.write(f"**Authors:** {row['AUTHORS']}")
-            st.write(f"**URL:** {row['ABS_URL']}")
-            st.write(row["ABSTRACT"])
+tab_dashboard, tab_search, tab_latest = st.tabs(["📈 Trends", "🔎 Research Search", "🆕 Latest Papers"])
+
+with tab_dashboard:
+    st.subheader("Topic distribution")
+    topic_counts = get_topic_counts()
+    if not topic_counts.empty:
+        st.bar_chart(topic_counts.set_index("TOPIC"))
+    st.subheader("Topic trends over the last 14 days")
+    trends = get_topic_trends()
+    if trends.empty:
+        st.info("Not enough recent papers to show trends yet.")
+    else:
+        pivot = trends.pivot_table(index="PUBLISHED_DAY", columns="TOPIC", values="N", aggfunc="sum", fill_value=0)
+        st.line_chart(pivot)
+
+with tab_search:
+    st.subheader("Semantic search over arXiv abstracts")
+    user_query = st.text_input("Ask a research question", placeholder="causal discovery with neural networks")
+    if st.button("Search", type="primary") and user_query:
+        with st.spinner("Embedding query and searching Snowflake..."):
+            retrieved = retrieve_papers(user_query, selected_topic, k)
+        if retrieved.empty:
+            st.warning("No matching papers found.")
+        else:
+            try:
+                log_query(user_query, selected_topic, retrieved)
+            except Exception as exc:
+                st.warning(f"Search worked, but query logging failed: {exc}")
+            st.subheader("Summary")
+            st.write(make_summary(user_query, retrieved))
+            st.subheader("Retrieved papers")
+            for i, row in retrieved.reset_index(drop=True).iterrows():
+                with st.expander(f"{i+1}. {row['TITLE']} · {row['TOPIC']} · similarity {row['SIMILARITY']:.3f}"):
+                    st.write(f"**arXiv ID:** {row['ARXIV_ID']}")
+                    st.write(f"**Published:** {row['PUBLISHED']}")
+                    st.write(f"**Primary category:** {row['PRIMARY_CATEGORY']}")
+                    st.write(f"**Categories:** {row['CATEGORIES']}")
+                    st.write(f"**Authors:** {row['AUTHORS']}")
+                    st.write(f"**URL:** {row['ABS_URL']}")
+                    st.write(row["ABSTRACT"])
+
+with tab_latest:
+    st.subheader(f"Latest papers: {selected_topic}")
+    latest = get_latest_papers(selected_topic, limit=20)
+    if latest.empty:
+        st.info("No papers available.")
+    else:
+        for _, row in latest.iterrows():
+            with st.expander(f"{row['TITLE']} · {row['TOPIC']} · {str(row['PUBLISHED'])[:10]}"):
+                st.write(f"**arXiv ID:** {row['ARXIV_ID']}")
+                st.write(f"**Primary category:** {row['PRIMARY_CATEGORY']}")
+                st.write(f"**URL:** {row['ABS_URL']}")
+                st.write(row["ABSTRACT"])

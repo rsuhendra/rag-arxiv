@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -19,9 +20,10 @@ class SnowflakeConfig:
     def from_env(cls) -> "SnowflakeConfig":
         required = [
             "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD",
-            "SNOWFLAKE_ROLE", "SNOWFLAKE_WAREHOUSE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA",
+            "SNOWFLAKE_ROLE", "SNOWFLAKE_WAREHOUSE", "SNOWFLAKE_DATABASE",
+            "SNOWFLAKE_SCHEMA",
         ]
-        missing = [x for x in required if not os.getenv(x)]
+        missing = [name for name in required if not os.getenv(name)]
         if missing:
             raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
         return cls(
@@ -35,12 +37,4 @@ class SnowflakeConfig:
         )
 
     def to_snowpark_dict(self) -> dict:
-        return {
-            "account": self.account,
-            "user": self.user,
-            "password": self.password,
-            "role": self.role,
-            "warehouse": self.warehouse,
-            "database": self.database,
-            "schema": self.schema,
-        }
+        return self.__dict__.copy()
