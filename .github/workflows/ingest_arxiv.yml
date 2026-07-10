@@ -2,21 +2,44 @@ name: Ingest arXiv Papers
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    # Run every day at 8:15 UTC.
+    # Avoid exactly midnight/hour boundaries because scheduled
+    # GitHub Actions may be delayed during high-load periods.
+    - cron: "15 8 * * *"
+
   workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Number of previous days to ingest"
+        required: true
+        default: "1"
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Determine ingestion window
+        id: ingestion_window
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "days_back=${{ inputs.days_back }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "days_back=2" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run ingestion
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -26,4 +49,8 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
-        run: python -m src.ingest --max-papers 100 --batch-size 50
+        run: |
+          python -m src.ingest \
+            --days-back "${{ steps.ingestion_window.outputs.days_back }}" \
+            --max-papers 2000 \
+            --batch-size 100
