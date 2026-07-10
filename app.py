@@ -11,6 +11,10 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 
 
+# -------------------------------------------------------------------
+# Page configuration
+# -------------------------------------------------------------------
+
 st.set_page_config(
     page_title="Live AI Research Assistant",
     page_icon="📚",
@@ -19,7 +23,8 @@ st.set_page_config(
 
 st.title("📚 Live AI Research Assistant")
 st.caption(
-    "Explore recent arXiv papers using topic trends and semantic vector search."
+    "Explore recent arXiv papers using topic trends and semantic "
+    "vector search."
 )
 
 
@@ -29,18 +34,28 @@ st.caption(
 
 @st.cache_resource
 def get_connection():
-    """Create and cache the Snowflake connection."""
+    """
+    Create and cache the Streamlit Snowflake connection.
+
+    Connection details are read from Streamlit secrets under:
+
+    [connections.snowflake]
+    """
     return st.connection("snowflake")
 
 
 @st.cache_resource
 def get_embedding_model() -> SentenceTransformer:
-    """Load the sentence-transformer model once per app process."""
+    """
+    Load the sentence-transformer model once per app process.
+    """
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
 def embed_query(query: str) -> list[float]:
-    """Convert a user query into a normalized 384-dimensional vector."""
+    """
+    Convert a query into a normalized 384-dimensional embedding.
+    """
     model = get_embedding_model()
 
     embedding = model.encode(
@@ -53,7 +68,7 @@ def embed_query(query: str) -> list[float]:
 
 
 # -------------------------------------------------------------------
-# Snowflake queries
+# Snowflake read queries
 # -------------------------------------------------------------------
 
 @st.cache_data(ttl=300)
@@ -86,6 +101,7 @@ def get_topics() -> list[str]:
     )
 
     topics = df["TOPIC"].dropna().astype(str).tolist()
+
     return ["All"] + topics
 
 
@@ -116,7 +132,11 @@ def get_topic_trends() -> pd.DataFrame:
             COALESCE(TOPIC, 'Other') AS TOPIC,
             COUNT(*) AS N
         FROM ARXIV_PAPERS
-        WHERE PUBLISHED >= DATEADD('DAY', -14, CURRENT_TIMESTAMP())
+        WHERE PUBLISHED >= DATEADD(
+            'DAY',
+            -14,
+            CURRENT_TIMESTAMP()
+        )
         GROUP BY
             DATE_TRUNC('DAY', PUBLISHED),
             COALESCE(TOPIC, 'Other')
@@ -126,8 +146,16 @@ def get_topic_trends() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def get_latest_papers(topic: str, limit: int = 20) -> pd.DataFrame:
+def get_latest_papers(
+    topic: str,
+    limit: int = 20,
+) -> pd.DataFrame:
+    """
+    Return the newest papers, optionally restricted to one topic.
+    """
     conn = get_connection()
+
+    safe_limit = max(1, min(int(limit), 100))
 
     if topic == "All":
         return conn.query(
@@ -142,7 +170,7 @@ def get_latest_papers(topic: str, limit: int = 20) -> pd.DataFrame:
                 ABS_URL
             FROM ARXIV_PAPERS
             ORDER BY PUBLISHED DESC
-            LIMIT {int(limit)}
+            LIMIT {safe_limit}
             """
         )
 
@@ -159,17 +187,24 @@ def get_latest_papers(topic: str, limit: int = 20) -> pd.DataFrame:
         FROM ARXIV_PAPERS
         WHERE TOPIC = ?
         ORDER BY PUBLISHED DESC
-        LIMIT {int(limit)}
+        LIMIT {safe_limit}
         """,
         params=[topic],
     )
+
 
 def retrieve_papers(
     user_query: str,
     topic: str,
     k: int,
 ) -> pd.DataFrame:
+    """
+    Embed the user query in Python and compare it against vectors
+    stored in Snowflake using cosine similarity.
+    """
     conn = get_connection()
+
+    safe_k = max(1, min(int(k), 20))
 
     query_embedding = embed_query(user_query)
     query_embedding_json = json.dumps(query_embedding)
@@ -193,7 +228,7 @@ def retrieve_papers(
         FROM ARXIV_PAPERS p
         WHERE p.EMBEDDING IS NOT NULL
         ORDER BY SIMILARITY DESC
-        LIMIT {int(k)}
+        LIMIT {safe_k}
         """
 
         params = [query_embedding_json]
@@ -218,7 +253,7 @@ def retrieve_papers(
         WHERE p.EMBEDDING IS NOT NULL
           AND p.TOPIC = ?
         ORDER BY SIMILARITY DESC
-        LIMIT {int(k)}
+        LIMIT {safe_k}
         """
 
         params = [
@@ -232,19 +267,30 @@ def retrieve_papers(
         ttl=0,
     )
 
+
+# -------------------------------------------------------------------
+# Snowflake write query
+# -------------------------------------------------------------------
+
 def log_query(
     user_query: str,
     topic: str,
     retrieved: pd.DataFrame,
 ) -> None:
-    """Store search metadata in ARXIV_QUERIES."""
+    """
+    Save basic search information in ARXIV_QUERIES.
+
+    We use the underlying Snowflake connector because conn.query()
+    is primarily intended for read queries.
+    """
     conn = get_connection()
 
     retrieved_ids = ",".join(
         retrieved["ARXIV_ID"].astype(str).tolist()
     )
 
-    cursor = conn.cursor()
+    raw_connection = conn.raw_connection
+    cursor = raw_connection.cursor()
 
     try:
         cursor.execute(
@@ -255,15 +301,18 @@ def log_query(
                 RETRIEVED_ARXIV_IDS,
                 NUM_RETRIEVED
             )
-            VALUES (%s, %s, %s, %s)
+            VALUES (?, ?, ?, ?)
             """,
-            (
+            [
                 user_query,
                 topic,
                 retrieved_ids,
                 int(len(retrieved)),
-            ),
+            ],
         )
+
+        raw_connection.commit()
+
     finally:
         cursor.close()
 
@@ -277,9 +326,10 @@ def make_retrieval_summary(
     retrieved: pd.DataFrame,
 ) -> str:
     """
-    Create a simple extractive summary without requiring an external LLM.
+    Create a lightweight extractive summary.
 
-    This is semantic retrieval, but not yet fully generative RAG.
+    This currently displays relevant abstracts rather than sending
+    the retrieved context to a generative LLM.
     """
     if retrieved.empty:
         return "No relevant papers were retrieved."
@@ -291,36 +341,43 @@ def make_retrieval_summary(
 
     top_results = retrieved.head(3).reset_index(drop=True)
 
-    for i, row in top_results.iterrows():
+    for index, row in top_results.iterrows():
         abstract = str(row["ABSTRACT"])
+        title = str(row["TITLE"])
+        topic = str(row.get("TOPIC", "Other"))
+        similarity = float(row["SIMILARITY"])
 
         preview = abstract[:400]
+
         if len(abstract) > 400:
             preview += "..."
 
-        title = str(row["TITLE"])
-        topic = str(row["TOPIC"])
-        similarity = float(row["SIMILARITY"])
-
         lines.append(
             (
-                f"**[{i + 1}] {title}**  \n"
-                f"Topic: {topic} · Similarity: {similarity:.3f}  \n"
+                f"**[{index + 1}] {title}**  \n"
+                f"Topic: {topic} · "
+                f"Similarity: {similarity:.3f}  \n"
                 f"{preview}\n"
             )
         )
 
     lines.append(
         "_This is an extractive retrieval summary. "
-        "A generative LLM can be added later to synthesize a full answer._"
+        "A generative LLM can be added later to synthesize "
+        "a full answer from the retrieved abstracts._"
     )
 
     return "\n".join(lines)
 
 
-def display_paper(row: pd.Series, index: int | None = None) -> None:
-    """Display one paper inside an expandable card."""
-    title = str(row["TITLE"])
+def display_paper(
+    row: pd.Series,
+    index: int | None = None,
+) -> None:
+    """
+    Display one paper in a Streamlit expander.
+    """
+    title = str(row.get("TITLE", "Untitled paper"))
     topic = str(row.get("TOPIC", "Other"))
 
     if index is not None and "SIMILARITY" in row:
@@ -330,35 +387,64 @@ def display_paper(row: pd.Series, index: int | None = None) -> None:
             f"{index}. {title} · {topic} · "
             f"similarity {similarity:.3f}"
         )
+
     else:
         published = str(row.get("PUBLISHED", ""))[:10]
         label = f"{title} · {topic} · {published}"
 
     with st.expander(label):
-        st.write(f"**arXiv ID:** {row.get('ARXIV_ID', '')}")
         st.write(
-            f"**Primary category:** "
+            f"**arXiv ID:** {row.get('ARXIV_ID', '')}"
+        )
+
+        st.write(
+            "**Primary category:** "
             f"{row.get('PRIMARY_CATEGORY', '')}"
         )
 
         if "CATEGORIES" in row:
-            st.write(f"**Categories:** {row.get('CATEGORIES', '')}")
+            st.write(
+                f"**Categories:** {row.get('CATEGORIES', '')}"
+            )
 
         if "AUTHORS" in row:
-            st.write(f"**Authors:** {row.get('AUTHORS', '')}")
+            st.write(
+                f"**Authors:** {row.get('AUTHORS', '')}"
+            )
 
-        st.write(f"**Published:** {row.get('PUBLISHED', '')}")
+        st.write(
+            f"**Published:** {row.get('PUBLISHED', '')}"
+        )
 
         url = row.get("ABS_URL")
 
         if url:
-            st.markdown(f"[Open on arXiv]({url})")
+            st.markdown(
+                f"[Open on arXiv]({url})"
+            )
 
-        st.write(row.get("ABSTRACT", ""))
+        st.write(
+            row.get("ABSTRACT", "")
+        )
 
 
 # -------------------------------------------------------------------
-# Load app data
+# Session-state callbacks
+# -------------------------------------------------------------------
+
+def set_example_query(example: str) -> None:
+    """
+    Update the text-input value before Streamlit recreates the widget.
+    """
+    st.session_state["research_query"] = example
+
+
+if "research_query" not in st.session_state:
+    st.session_state["research_query"] = ""
+
+
+# -------------------------------------------------------------------
+# Load app-level data
 # -------------------------------------------------------------------
 
 try:
@@ -390,12 +476,22 @@ try:
 except Exception as exc:
     st.error(
         "Could not query Snowflake. Check your Streamlit secrets, "
-        f"database objects, and permissions.\n\nError: {exc}"
+        "database objects, warehouse, role, and permissions.\n\n"
+        f"Error: {exc}"
     )
+
     st.stop()
 
 
-topics = get_topics()
+try:
+    topics = get_topics()
+
+except Exception as exc:
+    st.error(
+        f"Could not load topics from Snowflake: {exc}"
+    )
+
+    st.stop()
 
 
 # -------------------------------------------------------------------
@@ -421,8 +517,8 @@ with st.sidebar:
     st.divider()
 
     st.caption(
-        "Papers are embedded using all-MiniLM-L6-v2 and searched "
-        "using cosine similarity in Snowflake."
+        "Papers are embedded using all-MiniLM-L6-v2 and "
+        "searched using cosine similarity in Snowflake."
     )
 
 
@@ -446,37 +542,56 @@ tab_trends, tab_search, tab_latest = st.tabs(
 with tab_trends:
     st.subheader("Paper distribution by topic")
 
-    topic_counts = get_topic_counts()
+    try:
+        topic_counts = get_topic_counts()
 
-    if topic_counts.empty:
-        st.info("No topic data is available yet.")
-    else:
-        st.bar_chart(
-            topic_counts.set_index("TOPIC")["N"]
+        if topic_counts.empty:
+            st.info(
+                "No topic data is available yet."
+            )
+
+        else:
+            st.bar_chart(
+                topic_counts.set_index("TOPIC")["N"]
+            )
+
+    except Exception as exc:
+        st.error(
+            f"Could not load topic counts: {exc}"
         )
 
-    st.subheader("Topic trends over the last 14 days")
+    st.subheader(
+        "Topic trends over the last 14 days"
+    )
 
-    trends = get_topic_trends()
+    try:
+        trends = get_topic_trends()
 
-    if trends.empty:
-        st.info(
-            "There are not enough recent papers to show a trend chart yet."
+        if trends.empty:
+            st.info(
+                "There are not enough recent papers "
+                "to show a trend chart yet."
+            )
+
+        else:
+            trend_pivot = trends.pivot_table(
+                index="PUBLISHED_DAY",
+                columns="TOPIC",
+                values="N",
+                aggfunc="sum",
+                fill_value=0,
+            )
+
+            st.line_chart(trend_pivot)
+
+    except Exception as exc:
+        st.error(
+            f"Could not load topic trends: {exc}"
         )
-    else:
-        trend_pivot = trends.pivot_table(
-            index="PUBLISHED_DAY",
-            columns="TOPIC",
-            values="N",
-            aggfunc="sum",
-            fill_value=0,
-        )
-
-        st.line_chart(trend_pivot)
 
 
 # -------------------------------------------------------------------
-# Semantic search tab
+# Semantic-search tab
 # -------------------------------------------------------------------
 
 with tab_search:
@@ -489,9 +604,6 @@ with tab_search:
         "diffusion models for image generation",
     ]
 
-    if "research_query" not in st.session_state:
-        st.session_state.research_query = ""
-
     st.text_input(
         "Research question",
         key="research_query",
@@ -502,27 +614,32 @@ with tab_search:
 
     example_columns = st.columns(2)
 
-    for i, example in enumerate(examples):
-        column = example_columns[i % 2]
+    for index, example in enumerate(examples):
+        column = example_columns[index % 2]
 
-        if column.button(
+        column.button(
             example,
-            key=f"example_{i}",
+            key=f"example_query_{index}",
             use_container_width=True,
-        ):
-            st.session_state.research_query = example
-            st.rerun()
+            on_click=set_example_query,
+            args=(example,),
+        )
 
-    user_query = st.session_state.research_query.strip()
+    user_query = (
+        st.session_state["research_query"].strip()
+    )
 
-    if st.button(
+    search_clicked = st.button(
         "Search papers",
         type="primary",
         disabled=not user_query,
-    ):
+    )
+
+    if search_clicked:
         try:
             with st.spinner(
-                "Embedding your question and searching Snowflake..."
+                "Embedding your question and "
+                "searching Snowflake..."
             ):
                 retrieved = retrieve_papers(
                     user_query=user_query,
@@ -531,7 +648,9 @@ with tab_search:
                 )
 
             if retrieved.empty:
-                st.warning("No matching papers were found.")
+                st.warning(
+                    "No matching papers were found."
+                )
 
             else:
                 try:
@@ -540,10 +659,11 @@ with tab_search:
                         topic=selected_topic,
                         retrieved=retrieved,
                     )
+
                 except Exception as exc:
                     st.warning(
-                        "The search worked, but query logging failed: "
-                        f"{exc}"
+                        "The search worked, but query "
+                        f"logging failed: {exc}"
                     )
 
                 st.subheader("Retrieval summary")
@@ -557,33 +677,47 @@ with tab_search:
 
                 st.subheader("Retrieved papers")
 
-                for index, row in retrieved.reset_index(
+                retrieved_reset = retrieved.reset_index(
                     drop=True
-                ).iterrows():
+                )
+
+                for index, row in retrieved_reset.iterrows():
                     display_paper(
                         row,
                         index=index + 1,
                     )
 
         except Exception as exc:
-            st.error(f"Semantic search failed: {exc}")
+            st.error(
+                f"Semantic search failed: {exc}"
+            )
 
 
 # -------------------------------------------------------------------
-# Latest papers tab
+# Latest-papers tab
 # -------------------------------------------------------------------
 
 with tab_latest:
-    st.subheader(f"Latest papers: {selected_topic}")
-
-    latest_papers = get_latest_papers(
-        selected_topic,
-        limit=20,
+    st.subheader(
+        f"Latest papers: {selected_topic}"
     )
 
-    if latest_papers.empty:
-        st.info("No papers are available for this topic.")
+    try:
+        latest_papers = get_latest_papers(
+            selected_topic,
+            limit=20,
+        )
 
-    else:
-        for _, row in latest_papers.iterrows():
-            display_paper(row)
+        if latest_papers.empty:
+            st.info(
+                "No papers are available for this topic."
+            )
+
+        else:
+            for _, row in latest_papers.iterrows():
+                display_paper(row)
+
+    except Exception as exc:
+        st.error(
+            f"Could not load the latest papers: {exc}"
+        )
